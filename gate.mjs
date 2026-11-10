@@ -4,6 +4,7 @@ const entry=document.getElementById('entry'),workspace=document.getElementById('
 const input=document.getElementById('access'),error=document.getElementById('gate-error');
 const submit=document.getElementById('unlock'),status=document.getElementById('gate-status');
 let active=null,cleanup=null,styleLink=null,moduleURL=null,unlocking=false,idleTimer,hiddenTimer;
+let unlockEpoch=0,pendingUnlock=null,hiddenAt=document.hidden?Date.now():null;
 const bytes64=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
 const hex=bytes=>Array.from(bytes,x=>x.toString(16).padStart(2,'0')).join('');
 const abortError=()=>new DOMException('Session ended','AbortError');
@@ -64,6 +65,8 @@ function sessionAPI(key,catalog){
 }
 
 function lock(){
+ unlockEpoch++;pendingUnlock?.abort();pendingUnlock=null;unlocking=false;
+ submit.disabled=false;document.getElementById('busy').hidden=true;
  clearTimeout(idleTimer);clearTimeout(hiddenTimer);
  if(cleanup){try{cleanup();}catch{}cleanup=null;}
  if(active){active.dispose();active=null;}
@@ -74,7 +77,17 @@ function lock(){
 }
 function activity(){if(active){clearTimeout(idleTimer);idleTimer=setTimeout(lock,15*60*1000);}}
 for(const event of ['pointerdown','keydown','touchstart'])document.addEventListener(event,activity,{passive:true});
-document.addEventListener('visibilitychange',()=>{clearTimeout(hiddenTimer);if(active&&document.hidden)hiddenTimer=setTimeout(lock,2*60*1000);});
+function visibilityChanged(){
+ clearTimeout(hiddenTimer);
+ if(document.hidden){
+  hiddenAt??=Date.now();
+  if(active||unlocking)hiddenTimer=setTimeout(lock,Math.max(0,2*60*1000-(Date.now()-hiddenAt)));
+ }else{
+  const expired=hiddenAt!==null&&Date.now()-hiddenAt>=2*60*1000;hiddenAt=null;
+  if(expired&&(active||unlocking))lock();
+ }
+}
+document.addEventListener('visibilitychange',visibilityChanged);
 addEventListener('pagehide',lock);
 document.getElementById('show-password').onclick=()=>{
  const show=input.type==='password';input.type=show?'text':'password';
@@ -86,33 +99,48 @@ document.getElementById('unlock-form').addEventListener('submit',async event=>{
  event.preventDefault();if(unlocking)return;
  if(!input.value){error.textContent='请输入访问密码。';input.focus();return;}
  if(!crypto.subtle||!window.DecompressionStream){error.textContent='请使用更新版本的浏览器，并通过 HTTPS 打开。';return;}
+ const epoch=++unlockEpoch,controller=new AbortController();pendingUnlock=controller;
  unlocking=true;submit.disabled=true;document.getElementById('busy').hidden=false;error.textContent='';status.textContent='正在打开空间…';
- let api=null,root=null;
+ visibilityChanged();
+ const requireCurrent=()=>{
+  if(epoch===unlockEpoch&&document.hidden&&hiddenAt!==null&&Date.now()-hiddenAt>=2*60*1000)lock();
+  if(epoch!==unlockEpoch||controller.signal.aborted)throw abortError();
+ };
+ let api=null,root=null,cssURL=null,appURL=null;
  try{
   const password=encoder.encode(input.value);input.value='';
-  const response=await fetch('vault.json',{cache:'no-store'});if(!response.ok)throw new Error('Descriptor unavailable');
-  const config=await response.json();
+  const response=await fetch('vault.json',{cache:'no-store',signal:controller.signal});requireCurrent();if(!response.ok)throw new Error('Descriptor unavailable');
+  const config=await response.json();requireCurrent();
   if(config.version!==1||config.kdf.name!=='PBKDF2'||config.kdf.hash!=='SHA-256'||config.kdf.iterations<100000||config.kdf.iterations>5000000)throw new Error('Unsupported format');
   const material=await crypto.subtle.importKey('raw',password,'PBKDF2',false,['deriveKey']);password.fill(0);
-  const key=await crypto.subtle.deriveKey({name:'PBKDF2',salt:bytes64(config.kdf.salt),iterations:config.kdf.iterations,hash:'SHA-256'},material,{name:'AES-GCM',length:256},false,['decrypt']);
-  const encrypted=await fetchBytes(config.root);
-  root=JSON.parse(decoder.decode(await decompress(await decrypt(encrypted,key,'lumen-root-v1'))));
+  requireCurrent();const key=await crypto.subtle.deriveKey({name:'PBKDF2',salt:bytes64(config.kdf.salt),iterations:config.kdf.iterations,hash:'SHA-256'},material,{name:'AES-GCM',length:256},false,['decrypt']);requireCurrent();
+  const encrypted=await fetchBytes(config.root,controller.signal);requireCurrent();
+  root=JSON.parse(decoder.decode(await decompress(await decrypt(encrypted,key,'lumen-root-v1'))));requireCurrent();
   const rawKey=bytes64(root.data_key);delete root.data_key;
-  const dataKey=await crypto.subtle.importKey('raw',rawKey,{name:'AES-GCM'},false,['decrypt']);rawKey.fill(0);
+  const dataKey=await crypto.subtle.importKey('raw',rawKey,{name:'AES-GCM'},false,['decrypt']);rawKey.fill(0);requireCurrent();
   api=sessionAPI(dataKey,root.catalog);
-  const cssURL=URL.createObjectURL(new Blob([root.app.css],{type:'text/css'}));
-  styleLink=document.createElement('link');styleLink.rel='stylesheet';styleLink.href=cssURL;document.head.append(styleLink);
-  await new Promise((resolve,reject)=>{styleLink.onload=resolve;styleLink.onerror=reject;});URL.revokeObjectURL(cssURL);
+  cssURL=URL.createObjectURL(new Blob([root.app.css],{type:'text/css'}));
+  const link=document.createElement('link');link.rel='stylesheet';link.href=cssURL;styleLink=link;
+  await new Promise((resolve,reject)=>{
+   const cancel=()=>reject(abortError());
+   const finish=callback=>event=>{controller.signal.removeEventListener('abort',cancel);callback(event);};
+   link.onload=finish(resolve);link.onerror=finish(reject);controller.signal.addEventListener('abort',cancel,{once:true});document.head.append(link);
+  });requireCurrent();URL.revokeObjectURL(cssURL);cssURL=null;
   // Template and code are build-owned authenticated application files, never chat HTML.
   const template=document.createElement('template');template.innerHTML=root.app.html;
   workspace.replaceChildren(template.content.cloneNode(true));
-  moduleURL=URL.createObjectURL(new Blob([root.app.js],{type:'text/javascript'}));
-  const app=await import(moduleURL);root=null;active=api;
-  cleanup=await app.mount(api,workspace);
-  entry.hidden=true;workspace.hidden=false;document.title='Lumen';activity();
+  appURL=URL.createObjectURL(new Blob([root.app.js],{type:'text/javascript'}));moduleURL=appURL;
+  const app=await import(appURL);requireCurrent();root=null;active=api;
+  const mountedCleanup=await app.mount(api,workspace);
+  if(epoch!==unlockEpoch||controller.signal.aborted){mountedCleanup?.();throw abortError();}
+  cleanup=mountedCleanup;requireCurrent();
+  entry.hidden=true;workspace.hidden=false;document.title='Lumen';activity();visibilityChanged();
  }catch(e){
-  api?.dispose();root=null;workspace.replaceChildren();styleLink?.remove();styleLink=null;
-  if(moduleURL)URL.revokeObjectURL(moduleURL);moduleURL=null;active=null;
-  error.textContent='密码不正确，或页面资源暂不可用。请检查后重试。';status.textContent='内容仍保持锁定。';
- }finally{unlocking=false;submit.disabled=false;document.getElementById('busy').hidden=true;}
+  api?.dispose();root=null;
+  if(epoch===unlockEpoch){lock();error.textContent='密码不正确，或页面资源暂不可用。请检查后重试。';status.textContent='内容仍保持锁定。';}
+ }finally{
+  if(cssURL)URL.revokeObjectURL(cssURL);
+  if(epoch!==unlockEpoch&&appURL)URL.revokeObjectURL(appURL);
+  if(epoch===unlockEpoch){pendingUnlock=null;unlocking=false;submit.disabled=false;document.getElementById('busy').hidden=true;}
+ }
 });
